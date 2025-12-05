@@ -60,12 +60,6 @@ See the original connector diagram for visual pinouts.
 
 ## Wiring
 
-### System wiring diagram
-
-*(Replace filename if needed)*
-
-![UFO shutter wiring diagram](WiringDiagram.png)
-
 High-level connections:
 
 1. **24 V Power**
@@ -124,3 +118,17 @@ source .venv/bin/activate
 
 python -m pip install --upgrade pip
 pip install pyfirmata pyserial
+```
+> Python 3.13 note:
+At the time of writing, pyfirmata may require a small patch for
+Python ≥ 3.13:
+in `site-packages/pyfirmata/pyfirmata.py`, replace
+```bash
+inspect.getargspec
+```
+with 
+```bash
+inspect.getfullargspec
+```
+at the line where it is used. (typically line 185) 
+
