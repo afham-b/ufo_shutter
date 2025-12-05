@@ -6,7 +6,7 @@ original **UFO Shutter Controller** card as a stand-alone, Arduino-controlled
 
 The Arduino acts as a USB I/O card, and all high-current coil driving is still
 handled by the original shutter controller board exactly as it was in the
-satellite computer.
+fireball computer.
 
 ---
 
@@ -92,7 +92,7 @@ There are two main ways to drive the shutter:
 1. **Python + pyFirmata + StandardFirmata on Arduino**  
    (interactive I/O from the host computer)
 2. **Arduino test sketch** (`ufo_shutter_test.ino`)  
-   (simple, fixed-timing standalone test)
+   (simple, fixed-timing standalone test to bypass any compiler/arduino/pyfirmata issues)
 
 ### 1. Arduino firmware (StandardFirmata)
 
@@ -112,9 +112,9 @@ The Arduino is now a generic I/O device controlled over USB by pyFirmata.
 
 `ufo_shutter.py` is a small CLI tool that talks to the Arduino via pyFirmata.
 
-### Virtual environment setup (example on macOS)
+### Virtual environment setup
 
-From the project folder (e.g. `~/Desktop/ufo_shutter`):
+From the project folder (e.g. `~/ufo_shutter`):
 
 ```bash
 cd ~/Desktop/ufo_shutter
