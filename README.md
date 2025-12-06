@@ -132,3 +132,86 @@ inspect.getfullargspec
 ```
 at the line where it is used. (typically line 185) 
 
+
+---
+
+## Running the code 
+
+**ufo_shutter.py** – Command-line Shutter Control
+
+This script:
+1. Connects to the Arduino on a given serial port
+2. Configures D8 as a digital output
+3. Lets you open/close the shutter or pulse it for a specified time
+
+>Key configuration at the top of the script:
+
+Default serial port and pin; override from the command line if needed
+```bash
+DEFAULT_PORT = '/dev/cu.usbmodem101'   # macOS example
+SHUTTER_PIN_NUM = 8                    # D8 on Arduino
+
+OPEN_STATE = 0    # logic level that OPENS the shutter (LOW in this setup)
+CLOSED_STATE = 1  # logic level that CLOSES the shutter
+```
+you select ports for linux and windows using : 
+```bash
+DEFAULT_PORT = 'COM3'         #windows 
+DEFAULT_PORT = '/dev/ttyACM0' #linux
+```
+You can use the Arduino IDE to check which port the board is connected to, or use Devic Manager on Windows. 
+
+If your hardware is inverted (open actually closes), swap OPEN_STATE CLOSED_STATE.
+
+```bash
+OPEN_STATE = 1    # logic level that OPENS the shutter (HIGH in this setup)
+CLOSED_STATE = 0  # logic level that CLOSES the shutter
+```
+**Running the Script**
+
+#Activate the environment 
+```bash
+source .venv/bin/activate
+```
+You can call the script in two ways
+# Option A: use the default port hardcoded in the script
+```bash
+python ufo_shutter.py
+```
+
+# Option B: specify the port explicitly as a parameter 
+```bash
+python ufo_shutter.py /dev/cu.usbmodem101
+```
+
+**CLI commands**
+
+Once running, the script prints a small command menu:
+```bash 
+o → open shutter
+c → close shutter
+p <ms> → pulse open for <ms> milliseconds
+q → quit
+```
+
+Example: p 500 = open for 500 ms, then close
+If <ms> is omitted or invalid, defaults to 1000 ms
+
+
+---
+
+## Photos & Original Context
+
+Additional images in this repo show:
+
+The shutter controller in its original Fireball computer rack
+(Ufo_Controller_orginal_position.HEIC)
+
+Original wiring harnesses and terminal labels
+(ufo_Controller_old_wiring.HEIC)
+
+Original Fireball documentation diagrams
+(Screenshot 2025-12-04 at 7.37.54 PM.png,
+Screenshot 2025-12-04 at 7.38.45 PM.png)
+
+And Current Wiring Diagram shows the current wiring setup with the arduino. 
