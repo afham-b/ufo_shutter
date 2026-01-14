@@ -26,9 +26,16 @@ RELAY_OFF = 1
 
 
 #Switching guards (tune these as needed)
+PRE_SWITCH_OPEN_SEC   = 0.5       # open + let V880/coil settle before switching
 PRE_SWITCH_CLOSE_SEC   = 2.0      # close + let V880/coil settle before switching
 POST_SWITCH_SETTLE_SEC = 5.0      # let relay contacts settle after switching
 SECOND_CLOSE_AFTER_SWITCH = True  # helps ensure new shutter is in a known state
+DELAY_BEFORE_COMMAND = 1.0      # wait time after selecting shutter before sending commands
+
+#Params on how to exit script, and which state to leave shutter in
+EXIT_MODE = "open"   # "open" or "closed" # shutter state on exit, denergized is "open"
+EXIT_RELAY = "on"           # relay state on exit: "on" (energized LEDs on) or "off" Sometime the relays reset on exit so we leave it on. 
+DO_BOARD_EXIT = False  # if False, we DON'T call board.exit() so pins stay latched more reliably
 
 
 #for serial crashes that can happen if arduino is overvolted by back EMI from relays
@@ -52,12 +59,15 @@ def select_shutter_b(sel_pin) -> bool:
     return safe_write(sel_pin, RELAY_ON)   # relays ON  => NO => Shutter B
 
 
-def open_shutter(pin) -> bool:
+def open_shutter(pin, delay=False) -> bool:
+    if delay:
+        time.sleep(DELAY_BEFORE_COMMAND)
     return safe_write(pin, OPEN_STATE)
 
-def close_shutter(pin) -> bool:
+def close_shutter(pin, delay=False) -> bool:
+    if delay:
+        time.sleep(DELAY_BEFORE_COMMAND)
     return safe_write(pin, CLOSED_STATE)
-
 
 def pulse_shutter(pin, duration_ms: int) -> bool:
     if not open_shutter(pin):
@@ -65,18 +75,29 @@ def pulse_shutter(pin, duration_ms: int) -> bool:
     time.sleep(duration_ms / 1000.0)
     return close_shutter(pin)
 
+def relay_on(sel_pin) -> bool:
+    return safe_write(sel_pin, RELAY_ON)
+
+def relay_off(sel_pin) -> bool:
+    return safe_write(sel_pin, RELAY_OFF)
+
 def safe_select(target: str, sel_pin, shutter_pin) -> bool:
     """
     Safe relay switch:
-      1) close shutter (avoid switching while energized)
+      1) open shutter (avoid switching while energized, which is the closed state)
       2) wait for coil/driver to settle
       3) switch the relay
       4) wait for contacts to settles 
       5) optional: close again (new shutter known state)
     """
-    if not close_shutter(shutter_pin):
+    # if not close_shutter(shutter_pin):
+    #     return False
+    # time.sleep(PRE_SWITCH_CLOSE_SEC)
+
+    # open the shutter to de-energize the coil 
+    if not open_shutter(shutter_pin):
         return False
-    time.sleep(PRE_SWITCH_CLOSE_SEC)
+    time.sleep(PRE_SWITCH_OPEN_SEC)
 
     if target.upper() == "A":
         ok = select_shutter_a(sel_pin)
@@ -97,6 +118,9 @@ def safe_select(target: str, sel_pin, shutter_pin) -> bool:
 
 
 def main(port=DEFAULT_PORT):
+
+    global EXIT_MODE, EXIT_RELAY
+
     print(f"Connecting to Arduino on {port}...")
     board = Arduino(port)
 
@@ -112,12 +136,16 @@ def main(port=DEFAULT_PORT):
     sel_pin     = board.get_pin(f'd:{SELECT_PIN_NUM}:o')   # D9 output
 
     # Safe startup
-    close_shutter(shutter_pin)
+    
+    print("Seting up, please wait ~10 seconds.")
+    time.sleep(5.0)
     select_shutter_a(sel_pin)
     current = "A"
-    print("Seting up, please wait 5 seconds.")
-    time.sleep(5.0)
+    time.sleep(3.0)
+    close_shutter(shutter_pin)
+    time.sleep(2.0)
 
+     # Command loop
     print("Connected. Safe Switching version")
     print("Commands:")
     print("  o           -> open shutter (selected)")
@@ -127,6 +155,7 @@ def main(port=DEFAULT_PORT):
     print("  rb          -> select Shutter B (relays ON  -> NO) [SAFE SWITCH]")
     print("  rt          -> relay toggle test (A<->B) [SAFE SWITCH]")
     print("  q           -> quit")
+    #print("  qc          -> quit, leaving selected shutter CLOSED (energized)")
     print(f"\nCurrent shutter: {current}")
 
     try:
@@ -139,12 +168,12 @@ def main(port=DEFAULT_PORT):
             cmd = parts[0].lower()
 
             if cmd == 'o':
-                if not open_shutter(shutter_pin):
+                if not open_shutter(shutter_pin, delay=True):
                     break
                 print(f"Shutter {current}: OPEN")
 
             elif cmd == 'c':
-                if not close_shutter(shutter_pin):
+                if not close_shutter(shutter_pin, delay=True):
                     break
                 print(f"Shutter {current}: CLOSED")
 
@@ -160,22 +189,24 @@ def main(port=DEFAULT_PORT):
                     break
 
             elif cmd == 'ra':
+                print("Switching to Shutter B...please wait 10 seconds for safety before sending commands.")
                 if not safe_select("A", sel_pin, shutter_pin):
                     break
                 current = "A"
                 print("Selected Shutter A (relays OFF -> NC)")
 
             elif cmd == 'rb':
-                print("Switching to Shutter B...please wait 10 seconds for safety.")
+                print("Switching to Shutter B...please wait 10 seconds for safety before sending commands.")
                 if not safe_select("B", sel_pin, shutter_pin):
                     break
                 current = "B"
+                time.sleep(5.0)
                 print("Selected Shutter B (relays ON -> NO)")
 
-                #testing states 
-                #close_shutter(shutter_pin)  # ensure closed after switch
-                open_shutter(shutter_pin)   # optional: open after switch
-                close_shutter(shutter_pin)  # ensure closed after test
+                # #testing states 
+                # #close_shutter(shutter_pin)  # ensure closed after switch
+                # open_shutter(shutter_pin)   # optional: open after switch
+                # close_shutter(shutter_pin)  # ensure closed after test
 
             elif cmd == 'rt':
                 print("Relay toggle test (SAFE): A -> B -> A -> B -> A")
@@ -191,26 +222,71 @@ def main(port=DEFAULT_PORT):
                 print("Relay test done.")
 
             elif cmd == 'q':
-                print("Quitting.")
+                # default quit behavior
+                EXIT_MODE = "open"   # change default if you want
+                EXIT_RELAY = "on"
+                print("Quitting (default: leave shutter OPEN) and RELAY ON. Use qc for forced closed exit. May require manual reset.")
                 break
+                
+            elif cmd == 'qc':
+                EXIT_MODE = "closed"
+                EXIT_RELAY = "on"
+                print("Quitting: leave shutter CLOSED (energized) and RELAY ON.")
+                break
+
+            elif cmd == 'qoff':
+                EXIT_MODE = "open"
+                EXIT_RELAY = "off"
+                print("Quitting: leave shutter OPEN and relay OFF.")
+                break
+
+            elif cmd == 'qcoff':
+                EXIT_MODE = "closed"
+                EXIT_RELAY = "off"
+                print("Quitting: leave shutter OPEN and relay OFF.")
+                break
+
 
             else:
                 print("Unknown command. Use: o, c, p <ms>, ra, rb, rt, q")
 
     finally:
-        print("Closing shutter and releasing board...")
+        print("Exiting...setting final states...")
+
+        #1) Shutter exit state (skip the 1s command delay on exit)
         try:
-            close_shutter(shutter_pin)
+            if EXIT_MODE == "open":
+                open_shutter(shutter_pin, delay=False)
+                print("Exit mode: Shutter OPEN (de-energized).")
+            else:
+                close_shutter(shutter_pin, delay=False)
+                print("Exit mode: Shutter CLOSED.")
         except Exception:
             pass
+
+        #2) Relay exit state
         try:
-            select_shutter_a(sel_pin)
+            if EXIT_RELAY == "on":
+                relay_on(sel_pin)   # RELAY_ON (active-low -> write(0)) => LEDs on
+                print("Exit mode: Relay ON (energized, LEDs on).")
+            else:
+                relay_off(sel_pin)
+                print("Exit mode: Relay OFF.")
         except Exception:
             pass
-        try:
-            board.exit()
-        except Exception:
-            pass
+
+        # Give hardware a moment to settle before ending the program
+        time.sleep(0.5)
+
+        # IMPORTANT:
+        # If you call board.exit(), pyFirmata shuts down comms and some boards may reset pins.
+        # If you want the pin to remain latched, try leaving DO_BOARD_EXIT=False.
+        if DO_BOARD_EXIT:
+            try:
+                board.exit()
+            except Exception:
+                pass
+
         print("Done.")
 
 
