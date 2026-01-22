@@ -10,7 +10,9 @@ from serial.serialutil import SerialException
 # --- CONFIG ---
 # Default serial port and pin; you can override from command line.
 #DEFAULT_PORT = 'COM3'      # e.g. '/dev/ttyACM0' on Linux 
-DEFAULT_PORT = '/dev/cu.usbmodem101' #mac 
+#DEFAULT_PORT = '/dev/cu.usbmodem101' #mac 
+#DEFAULT_PORT = '/dev/tty.usbserial-10' #MAC,but I swapped for a differnt board 
+DEFAULT_PORT = '/dev/cu.usbserial-1320' 
 SHUTTER_PIN_NUM = 8        # D8 on Arduino
 
 SELECT_PIN_NUM  = 9                  # D9 -> Relay IN1 and IN2 (Y-split)
@@ -24,6 +26,10 @@ CLOSED_STATE = 1
 RELAY_ON  = 0
 RELAY_OFF = 1
 
+SHUTTER_LOSS_MS = 37  # calibrate later; start with 37 based on your 451 fps run
+# Calibrated from 451 fps fit for >=200 ms
+CAL_A = 1.003146   # slope
+CAL_B = 37.971     # ms (since measured ≈ A*cmd - B)
 
 #Switching guards (tune these as needed)
 PRE_SWITCH_OPEN_SEC   = 0.5       # open + let V880/coil settle before switching
@@ -69,11 +75,29 @@ def close_shutter(pin, delay=False) -> bool:
         time.sleep(DELAY_BEFORE_COMMAND)
     return safe_write(pin, CLOSED_STATE)
 
-def pulse_shutter(pin, duration_ms: int) -> bool:
+#calculate commanded pulse for desired effective open time
+def cmd_for_effective_ms(target_ms: float) -> int:
+    """
+    Convert desired effective exposure (ms) -> commanded pulse (ms)
+    using: measured ≈ A*cmd - B  =>  cmd ≈ (target + B)/A
+    """
+    cmd = (target_ms + CAL_B) / CAL_A
+    return max(1, int(round(cmd)))
+
+def _pulse_shutter_raw(pin, cmd_ms: int) -> bool:
+    #actuate the shutter for cmd_ms milliseconds (no compensation)
     if not open_shutter(pin):
         return False
-    time.sleep(duration_ms / 1000.0)
+    time.sleep(cmd_ms / 1000.0)
     return close_shutter(pin)
+
+def pulse_shutter(pin, duration_ms: int, offset: bool = True) -> bool:
+    if offset:
+        cmd_ms = cmd_for_effective_ms(duration_ms)   # duration_ms treated as target effective
+    else:
+        cmd_ms = int(duration_ms)                    # duration_ms treated as commanded
+
+    return _pulse_shutter_raw(pin, cmd_ms)
 
 def relay_on(sel_pin) -> bool:
     return safe_write(sel_pin, RELAY_ON)
@@ -116,6 +140,23 @@ def safe_select(target: str, sel_pin, shutter_pin) -> bool:
 
     return True
 
+def sweep_pulses(shutter_pin, durations_ms, gap_s=2.0, offset=False):
+    """
+    Runs a repeatable pulse train while you record on the camera.
+    Prints timestamps so you can correlate to video if needed.
+    """
+    t0 = time.perf_counter()
+    for ms in durations_ms:
+        # ensure closed baseline before each test pulse
+        close_shutter(shutter_pin)
+        time.sleep(gap_s)
+
+        print(f"[{time.perf_counter()-t0:8.3f}s] PULSE {ms} ms")
+        pulse_shutter(shutter_pin, ms, offset=offset)
+
+    close_shutter(shutter_pin)
+    print("Sweep done.")
+
 
 def main(port=DEFAULT_PORT):
 
@@ -154,6 +195,8 @@ def main(port=DEFAULT_PORT):
     print("  ra          -> select Shutter A (relays OFF -> NC) [SAFE SWITCH]")
     print("  rb          -> select Shutter B (relays ON  -> NO) [SAFE SWITCH]")
     print("  rt          -> relay toggle test (A<->B) [SAFE SWITCH]")
+    print("  sw          -> enter Sweep Pulse mode (predefined pulse train) for testing")
+    print("  swo         -> enter Sweep Pulse mode with offset compensation for testing")
     print("  q           -> quit")
     #print("  qc          -> quit, leaving selected shutter CLOSED (energized)")
     print(f"\nCurrent shutter: {current}")
@@ -220,6 +263,22 @@ def main(port=DEFAULT_PORT):
                 print("  A (OFF)")
                 current = "A"
                 print("Relay test done.")
+
+            elif cmd == 'sw':
+                # sweep for timing characterization in milliseconds
+                durations = [10,20,30,50,75,100,150,200,250,260,270,280,287,290,300,310,500,750,1000,1500,2000,2500,3000,4000]
+                gap_s = 2.0 # gap between pulses in seconds 
+                print("Starting sweep. Start ASICap recording now.")
+                time.sleep(5.0)
+                sweep_pulses(shutter_pin, durations_ms=durations, gap_s=gap_s, offset=False)
+
+            elif cmd == 'swo':
+                # sweep for timing characterization in milliseconds
+                durations = [10,20,30,50,75,100,150,200,250,260,270,280,287,290,300,310,500,750,1000,1500,2000,2500,3000,4000]
+                gap_s = 2.0 # gap between pulses in seconds
+                print("Starting sweep with offset compensation. Start ASICap recording now.")
+                time.sleep(5.0)
+                sweep_pulses(shutter_pin, durations_ms=durations, gap_s=gap_s, offset=True)
 
             elif cmd == 'q':
                 # default quit behavior
