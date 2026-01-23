@@ -43,6 +43,13 @@ def robust_threshold(signal):
     # threshold halfway between low/high clusters
     return (lo + hi) / 2.0
 
+def frac_threshold(signal, frac=0.9):
+    s = np.asarray(signal, dtype=float)
+    closed = np.percentile(s, 10)   # dark baseline
+    open_  = np.percentile(s, 90)   # bright plateau
+    return closed + frac * (open_ - closed)
+
+
 def main(video_path, output_csv="shutter_timing_results.csv"):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -85,7 +92,9 @@ def main(video_path, output_csv="shutter_timing_results.csv"):
     #testing at 1 frame for sharper transitions
     sm = moving_average(means, 1)
 
-    thr = robust_threshold(sm)
+    #thr = robust_threshold(sm)
+    thr = frac_threshold(sm, frac=0.99)   # 0.9 ~ "mostly/fully open"
+
     is_open = sm > thr
 
     # Find open segments; require at least 2 frames open (~18 ms)
@@ -154,5 +163,5 @@ if __name__ == "__main__":
 #   -an -c:v mjpeg -q:v 1 \
 #   "/Users/afhambashir/ASICAP/CapObj/2026-01-21Z/2026-01-21-2104_9-CapObj_mjpeg.avi"
 
-
+#example usage:
 #python3 analyze_shutter_avi.py /Users/afhambashir/ASICAP/2026-01-21-2104_9-CapObj.AVI

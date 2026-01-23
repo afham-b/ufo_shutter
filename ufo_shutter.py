@@ -12,7 +12,7 @@ from serial.serialutil import SerialException
 #DEFAULT_PORT = 'COM3'      # e.g. '/dev/ttyACM0' on Linux 
 #DEFAULT_PORT = '/dev/cu.usbmodem101' #mac 
 #DEFAULT_PORT = '/dev/tty.usbserial-10' #MAC,but I swapped for a differnt board 
-DEFAULT_PORT = '/dev/cu.usbserial-1320' 
+DEFAULT_PORT = '/dev/cu.usbserial-11320' 
 SHUTTER_PIN_NUM = 8        # D8 on Arduino
 
 SELECT_PIN_NUM  = 9                  # D9 -> Relay IN1 and IN2 (Y-split)
@@ -27,9 +27,9 @@ RELAY_ON  = 0
 RELAY_OFF = 1
 
 SHUTTER_LOSS_MS = 37  # calibrate later; start with 37 based on your 451 fps run
-# Calibrated from 451 fps fit for >=200 ms
-CAL_A = 1.003146   # slope
-CAL_B = 37.971     # ms (since measured ≈ A*cmd - B)
+# Calibrated from 451 fps fit, shutter takes between. 75-80ms for full retraction from close
+CAL_A = 0.9943244546 #slope 
+CAL_B = 53.67871603  # ms (since measured ≈ A*cmd - B)
 
 #Switching guards (tune these as needed)
 PRE_SWITCH_OPEN_SEC   = 0.5       # open + let V880/coil settle before switching
