@@ -11,7 +11,7 @@ from serial.serialutil import SerialException
 # Default serial port and pin; you can override from command line.
 #DEFAULT_PORT = 'COM3'      # e.g. '/dev/ttyACM0' on Linux 
 #DEFAULT_PORT = '/dev/cu.usbmodem101' #mac 
-#DEFAULT_PORT = '/dev/tty.usbserial-10' #MAC,but I swapped for a differnt board 
+#DEFAULT_PORT = '/dev/tty.usbserial-110' #MAC,but I swapped for a differnt board 
 DEFAULT_PORT = '/dev/cu.usbserial-11320' 
 SHUTTER_PIN_NUM = 8        # D8 on Arduino
 
@@ -266,11 +266,14 @@ def main(port=DEFAULT_PORT):
 
             elif cmd == 'sw':
                 # sweep for timing characterization in milliseconds
-                durations = [10,20,30,50,75,100,150,200,250,260,270,280,287,290,300,310,500,750,1000,1500,2000,2500,3000,4000]
-                gap_s = 2.0 # gap between pulses in seconds 
+                durations1 = [10,20,30,50,75,100,150,200,250,260,270,280,287,290,300,310,500,750,1000,1500,2000,2500,3000,4000]
+                durations2 = [10,12,15,17,20,22,24,26,28,30,32,34,36,38,40,42,45,50,60,75,80,85,100,150]
+                durations3 = [10,11,12,13,14,15,16,17,18,19,20,22,24,26,28,30]
+                durations4 = [75,76,77,78,79,80,81,82,83,84,85]
+                gap_s = 3.0 # gap between pulses in seconds 
                 print("Starting sweep. Start ASICap recording now.")
                 time.sleep(5.0)
-                sweep_pulses(shutter_pin, durations_ms=durations, gap_s=gap_s, offset=False)
+                sweep_pulses(shutter_pin, durations_ms=durations4, gap_s=gap_s, offset=False)
 
             elif cmd == 'swo':
                 # sweep for timing characterization in milliseconds
