@@ -1,7 +1,10 @@
 # ufo_shutter_pyfirmata.py
 
+import csv
+import os
 import time
 import sys
+from datetime import datetime
 from pyfirmata import Arduino, util
 from serial.serialutil import SerialException
 
@@ -12,7 +15,7 @@ from serial.serialutil import SerialException
 #DEFAULT_PORT = 'COM3'      # e.g. '/dev/ttyACM0' on Linux 
 #DEFAULT_PORT = '/dev/cu.usbmodem101' #mac 
 #DEFAULT_PORT = '/dev/tty.usbserial-110' #MAC,but I swapped for a differnt board 
-DEFAULT_PORT = '/dev/cu.usbserial-11320' 
+DEFAULT_PORT = '/dev/cu.usbserial-10' 
 SHUTTER_PIN_NUM = 8        # D8 on Arduino
 
 SELECT_PIN_NUM  = 9                  # D9 -> Relay IN1 and IN2 (Y-split)
@@ -30,6 +33,14 @@ SHUTTER_LOSS_MS = 37  # calibrate later; start with 37 based on your 451 fps run
 # Calibrated from 451 fps fit, shutter takes between. 75-80ms for full retraction from close
 CAL_A = 0.9943244546 #slope 
 CAL_B = 53.67871603  # ms (since measured ≈ A*cmd - B)
+MASTER_CAL_INVERSE_CSV = os.path.join(
+    os.path.dirname(__file__),
+    "results_flux_ring_profile_sweep",
+    "rin30_rout65_bgin85_bgout115",
+    "reference",
+    "master_inverse_lookup.csv",
+)
+COMMAND_LOG_DIR = os.path.join(os.path.dirname(__file__), "command_logs")
 
 #Switching guards (tune these as needed)
 PRE_SWITCH_OPEN_SEC   = 0.5       # open + let V880/coil settle before switching
@@ -42,6 +53,8 @@ DELAY_BEFORE_COMMAND = 1.0      # wait time after selecting shutter before sendi
 EXIT_MODE = "open"   # "open" or "closed" # shutter state on exit, denergized is "open"
 EXIT_RELAY = "on"           # relay state on exit: "on" (energized LEDs on) or "off" Sometime the relays reset on exit so we leave it on. 
 DO_BOARD_EXIT = False  # if False, we DON'T call board.exit() so pins stay latched more reliably
+
+_inverse_lookup_cache = None
 
 
 #for serial crashes that can happen if arduino is overvolted by back EMI from relays
@@ -75,13 +88,54 @@ def close_shutter(pin, delay=False) -> bool:
         time.sleep(DELAY_BEFORE_COMMAND)
     return safe_write(pin, CLOSED_STATE)
 
-#calculate commanded pulse for desired effective open time
+def _load_inverse_lookup(path):
+    table = []
+    if not path or not os.path.exists(path):
+        return table
+
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            table.append((float(row["target_metric_ms"]), float(row["command_ms"])))
+    return table
+
+
+def _interp_lookup(x, table):
+    if not table:
+        return None
+
+    x = float(x)
+    if x <= table[0][0]:
+        return table[0][1]
+
+    for i in range(1, len(table)):
+        x0, y0 = table[i - 1]
+        x1, y1 = table[i]
+        if x <= x1:
+            if x1 == x0:
+                return y1
+            frac = (x - x0) / (x1 - x0)
+            return y0 + frac * (y1 - y0)
+
+    # For targets above calibrated range, clamp to last calibrated command.
+    # This avoids extrapolating outside measured data.
+    return table[-1][1]
+
+
+# calculate commanded pulse for desired delivered metric exposure
 def cmd_for_effective_ms(target_ms: float) -> int:
     """
-    Convert desired effective exposure (ms) -> commanded pulse (ms)
-    using: measured ≈ A*cmd - B  =>  cmd ≈ (target + B)/A
+    Convert desired delivered exposure metric (ms) -> commanded pulse (ms).
+    Prefer the monotone CSV lookup when present. Fall back to the old linear fit.
     """
-    cmd = (target_ms + CAL_B) / CAL_A
+    global _inverse_lookup_cache
+
+    if _inverse_lookup_cache is None:
+        _inverse_lookup_cache = _load_inverse_lookup(MASTER_CAL_INVERSE_CSV)
+
+    cmd = _interp_lookup(target_ms, _inverse_lookup_cache)
+    if cmd is None:
+        cmd = (target_ms + CAL_B) / CAL_A
     return max(1, int(round(cmd)))
 
 def _pulse_shutter_raw(pin, cmd_ms: int) -> bool:
@@ -140,19 +194,70 @@ def safe_select(target: str, sel_pin, shutter_pin) -> bool:
 
     return True
 
-def sweep_pulses(shutter_pin, durations_ms, gap_s=2.0, offset=False):
+def _start_recording_log(recording_tag: str, offset: bool):
+    os.makedirs(COMMAND_LOG_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode = "comp" if offset else "raw"
+    name = f"{recording_tag}_{mode}_{ts}.csv"
+    path = os.path.join(COMMAND_LOG_DIR, name)
+    f = open(path, "w", newline="")
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "pulse_index",
+            "requested_ms",
+            "commanded_ms",
+            "compensated",
+            "send_time_iso",
+            "send_time_epoch_s",
+            "elapsed_s",
+        ],
+    )
+    writer.writeheader()
+    return path, f, writer
+
+
+def sweep_pulses(shutter_pin, durations_ms, gap_s=3.0, offset=False, recording_tag="recording"):
     """
     Runs a repeatable pulse train while you record on the camera.
     Prints timestamps so you can correlate to video if needed.
     """
     t0 = time.perf_counter()
-    for ms in durations_ms:
-        # ensure closed baseline before each test pulse
-        close_shutter(shutter_pin)
-        time.sleep(gap_s)
+    log_path, log_f, log_w = _start_recording_log(recording_tag=recording_tag, offset=offset)
+    print(f"Command log: {log_path}")
 
-        print(f"[{time.perf_counter()-t0:8.3f}s] PULSE {ms} ms")
-        pulse_shutter(shutter_pin, ms, offset=offset)
+    try:
+        for i, requested_ms in enumerate(durations_ms, start=1):
+            # ensure closed baseline before each test pulse
+            close_shutter(shutter_pin)
+            time.sleep(gap_s)
+
+            commanded_ms = cmd_for_effective_ms(requested_ms) if offset else int(requested_ms)
+            send_epoch = time.time()
+            send_iso = datetime.fromtimestamp(send_epoch).isoformat(timespec="milliseconds")
+            elapsed = time.perf_counter() - t0
+
+            print(
+                f"[{elapsed:8.3f}s] PULSE idx={i} req={requested_ms}ms "
+                f"cmd={commanded_ms}ms send={send_iso}"
+            )
+
+            log_w.writerow({
+                "pulse_index": i,
+                "requested_ms": int(requested_ms),
+                "commanded_ms": int(commanded_ms),
+                "compensated": int(bool(offset)),
+                "send_time_iso": send_iso,
+                "send_time_epoch_s": f"{send_epoch:.6f}",
+                "elapsed_s": f"{elapsed:.6f}",
+            })
+            log_f.flush()
+
+            if not _pulse_shutter_raw(shutter_pin, int(commanded_ms)):
+                print("[ERROR] Pulse command failed; stopping sweep.")
+                break
+    finally:
+        log_f.close()
 
     close_shutter(shutter_pin)
     print("Sweep done.")
@@ -191,7 +296,8 @@ def main(port=DEFAULT_PORT):
     print("Commands:")
     print("  o           -> open shutter (selected)")
     print("  c           -> close shutter")
-    print("  p <ms>      -> pulse open for <ms> milliseconds (e.g. 'p 500')")
+    print("  p <ms>      -> pulse with compensation from master_inverse_lookup.csv")
+    print("  p <ms> n    -> pulse RAW command (no compensation)")
     print("  ra          -> select Shutter A (relays OFF -> NC) [SAFE SWITCH]")
     print("  rb          -> select Shutter B (relays ON  -> NO) [SAFE SWITCH]")
     print("  rt          -> relay toggle test (A<->B) [SAFE SWITCH]")
@@ -222,13 +328,50 @@ def main(port=DEFAULT_PORT):
 
             elif cmd == 'p':
                 duration_ms = 1000
+                raw_mode = False
                 if len(parts) > 1:
                     try:
                         duration_ms = int(parts[1])
                     except ValueError:
                         print("Invalid ms; using default 1000.")
-                print(f"Pulsing Shutter {current} open for {duration_ms} ms...")
-                if not pulse_shutter(shutter_pin, duration_ms):
+
+                if len(parts) > 2:
+                    token = parts[2].strip().lower()
+                    if token == "n":
+                        raw_mode = True
+                    else:
+                        print("Usage: p <ms> [n]")
+                        continue
+
+                if raw_mode:
+                    cmd_ms = int(duration_ms)
+                    print(f"Pulsing Shutter {current} RAW for {cmd_ms} ms (no compensation)...")
+                else:
+                    cmd_ms = cmd_for_effective_ms(duration_ms)
+                    print(
+                        f"Pulsing Shutter {current} target={duration_ms} ms "
+                        f"-> compensated command={cmd_ms} ms..."
+                    )
+
+                send_epoch = time.time()
+                send_iso = datetime.fromtimestamp(send_epoch).isoformat(timespec="milliseconds")
+                log_path, log_f, log_w = _start_recording_log(
+                    recording_tag="manual_pulse",
+                    offset=(not raw_mode),
+                )
+                log_w.writerow({
+                    "pulse_index": 1,
+                    "requested_ms": int(duration_ms),
+                    "commanded_ms": int(cmd_ms),
+                    "compensated": int(not raw_mode),
+                    "send_time_iso": send_iso,
+                    "send_time_epoch_s": f"{send_epoch:.6f}",
+                    "elapsed_s": "0.000000",
+                })
+                log_f.close()
+                print(f"Command log: {log_path}")
+
+                if not _pulse_shutter_raw(shutter_pin, cmd_ms):
                     break
 
             elif cmd == 'ra':
@@ -273,7 +416,13 @@ def main(port=DEFAULT_PORT):
                 gap_s = 3.0 # gap between pulses in seconds 
                 print("Starting sweep. Start ASICap recording now.")
                 time.sleep(5.0)
-                sweep_pulses(shutter_pin, durations_ms=durations4, gap_s=gap_s, offset=False)
+                sweep_pulses(
+                    shutter_pin,
+                    durations_ms=durations4,
+                    gap_s=gap_s,
+                    offset=False,
+                    recording_tag="sw_durations4",
+                )
 
             elif cmd == 'swo':
                 # sweep for timing characterization in milliseconds
@@ -281,7 +430,13 @@ def main(port=DEFAULT_PORT):
                 gap_s = 2.0 # gap between pulses in seconds
                 print("Starting sweep with offset compensation. Start ASICap recording now.")
                 time.sleep(5.0)
-                sweep_pulses(shutter_pin, durations_ms=durations, gap_s=gap_s, offset=True)
+                sweep_pulses(
+                    shutter_pin,
+                    durations_ms=durations,
+                    gap_s=gap_s,
+                    offset=True,
+                    recording_tag="swo_durations1",
+                )
 
             elif cmd == 'q':
                 # default quit behavior
@@ -310,7 +465,7 @@ def main(port=DEFAULT_PORT):
 
 
             else:
-                print("Unknown command. Use: o, c, p <ms>, ra, rb, rt, q")
+                print("Unknown command. Use: o, c, p <ms>, p <ms> n, ra, rb, rt, q")
 
     finally:
         print("Exiting...setting final states...")
