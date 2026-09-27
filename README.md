@@ -1,6 +1,6 @@
-# UFO Shutter Controller (Fireball Re-use)
+# UFO Shutter Controller
 
-This project repurposes the **Fireball weather balloon “UFO” shutter** and its
+This project repurposes the **Fireball “UFO” shutter** and its
 original **UFO Shutter Controller** card as a stand-alone, Arduino-controlled
 24 V shutter system.
 
