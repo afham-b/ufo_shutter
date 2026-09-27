@@ -183,8 +183,12 @@ On Windows PowerShell:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
+Single Shutter Fast Mode + Automatically find the port:
+```bash
+python ufo_shutter.py --fast 
+```
 
-Automatically find the port:
+Dual Shutter Mode + Automatically find the port:
 ```bash
 python ufo_shutter.py
 ```
