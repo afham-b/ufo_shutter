@@ -1,21 +1,24 @@
 # ufo_shutter_pyfirmata.py
 
+import argparse
 import csv
+import math
 import os
 import time
 import sys
 from datetime import datetime
-from pyfirmata import Arduino, util
 from serial.serialutil import SerialException
+from serial_ports import (
+    PortSelectionError,
+    available_ports,
+    describe_port,
+    select_serial_port,
+)
 
 #!!!! When you install pyfrimata, in pyfirmata.py, change inspect.getargspec to inspect.getfullargspec @ line 185 !!!
 
 # --- CONFIG ---
-# Default serial port and pin; you can override from command line.
-#DEFAULT_PORT = 'COM3'      # e.g. '/dev/ttyACM0' on Linux 
-#DEFAULT_PORT = '/dev/cu.usbmodem101' #mac 
-#DEFAULT_PORT = '/dev/tty.usbserial-110' #MAC,but I swapped for a differnt board 
-DEFAULT_PORT = '/dev/cu.usbserial-10' 
+# The serial port is auto-detected unless supplied on the command line.
 SHUTTER_PIN_NUM = 8        # D8 on Arduino
 
 SELECT_PIN_NUM  = 9                  # D9 -> Relay IN1 and IN2 (Y-split)
@@ -48,6 +51,7 @@ PRE_SWITCH_CLOSE_SEC   = 2.0      # close + let V880/coil settle before switchin
 POST_SWITCH_SETTLE_SEC = 5.0      # let relay contacts settle after switching
 SECOND_CLOSE_AFTER_SWITCH = True  # helps ensure new shutter is in a known state
 DELAY_BEFORE_COMMAND = 1.0      # wait time after selecting shutter before sending commands
+FAST_MIN_CLOSED_MS = 200.0     # provisional recovery guard, not a measured minimum
 
 #Params on how to exit script, and which state to leave shutter in
 EXIT_MODE = "open"   # "open" or "closed" # shutter state on exit, denergized is "open"
@@ -66,6 +70,89 @@ def safe_write(pin, value) -> bool:
     except (OSError, SerialException) as e:
         print(f"[SERIAL LOST] {e}")
         return False
+
+
+class RelayOffPin:
+    """In fast mode, allow only the NC/A selector state after initialization."""
+
+    def __init__(self, pin):
+        self.pin = pin
+        self.failed = False
+
+    def write(self, value):
+        if value != RELAY_OFF:
+            raise ValueError("Fast mode locks the selector OFF on Shutter A.")
+        if self.failed:
+            raise SerialException("Selector connection previously failed; restart required.")
+        try:
+            self.pin.write(value)
+        except (OSError, SerialException):
+            self.failed = True
+            raise
+
+
+class FastShutterPin:
+    """Track commanded state and wait only for outstanding closure recovery.
+
+    This is a host-side time guard, not feedback of the physical blade position.
+    A serial failure is latched because Firmata may have cached an unsent value.
+    """
+
+    def __init__(self, pin, min_closed_ms=FAST_MIN_CLOSED_MS):
+        if not math.isfinite(min_closed_ms) or min_closed_ms <= 0:
+            raise ValueError("Minimum closed time must be finite and greater than zero.")
+        self.pin = pin
+        self.min_closed_s = min_closed_ms / 1000.0
+        self.state = None
+        self.closed_at = None
+        self.failed = False
+
+    def wait_closed(self, minimum_s=0.0):
+        if self.closed_at is not None:
+            remaining = max(self.min_closed_s, minimum_s) - (time.monotonic() - self.closed_at)
+            if remaining > 0:
+                time.sleep(remaining)
+
+    def write(self, value):
+        if self.failed:
+            raise SerialException("Shutter connection previously failed; restart required.")
+        if value == OPEN_STATE and self.state == CLOSED_STATE:
+            self.wait_closed()
+        try:
+            self.pin.write(value)
+        except (OSError, SerialException):
+            self.failed = True
+            self.state = None
+            self.closed_at = None
+            raise
+        if value == CLOSED_STATE and self.state != CLOSED_STATE:
+            self.closed_at = time.monotonic()
+        elif value == OPEN_STATE:
+            self.closed_at = None
+        self.state = value
+
+    def prepare_pulse(self, minimum_s=0.0):
+        # An open or unknown starting state must first be closed and allowed
+        # to recover. Repeated close commands do not restart the recovery clock.
+        if not safe_write(self, CLOSED_STATE):
+            return False
+        self.wait_closed(minimum_s)
+        return True
+
+
+def parse_pulse_command(parts):
+    """p [ms] is raw; p <ms> o opts in to compensation; n remains a raw alias."""
+    if len(parts) > 3 or (len(parts) == 3 and parts[2].lower() not in ("o", "n")):
+        raise ValueError("Usage: p <positive integer ms> [o|n]")
+    try:
+        duration_ms = int(parts[1]) if len(parts) > 1 else 1000
+    except ValueError:
+        raise ValueError("Pulse duration must be a positive integer in milliseconds.") from None
+    if duration_ms <= 0:
+        raise ValueError("Pulse duration must be a positive integer in milliseconds.")
+    offset = len(parts) == 3 and parts[2].lower() == "o"
+    return duration_ms, offset
+
 
 # Wiring assumption:
 # Shutter A on NC (default when relays OFF)  -> COM->NC
@@ -140,12 +227,21 @@ def cmd_for_effective_ms(target_ms: float) -> int:
 
 def _pulse_shutter_raw(pin, cmd_ms: int) -> bool:
     #actuate the shutter for cmd_ms milliseconds (no compensation)
+    if not isinstance(cmd_ms, int) or isinstance(cmd_ms, bool) or cmd_ms <= 0:
+        raise ValueError("Pulse duration must be a positive integer in milliseconds.")
+    if isinstance(pin, FastShutterPin) and not pin.prepare_pulse():
+        return False
     if not open_shutter(pin):
         return False
-    time.sleep(cmd_ms / 1000.0)
-    return close_shutter(pin)
+    try:
+        time.sleep(cmd_ms / 1000.0)
+    finally:
+        closed = close_shutter(pin)
+    return closed
 
-def pulse_shutter(pin, duration_ms: int, offset: bool = True) -> bool:
+def pulse_shutter(pin, duration_ms: int, offset: bool = False) -> bool:
+    if not isinstance(duration_ms, int) or isinstance(duration_ms, bool) or duration_ms <= 0:
+        raise ValueError("Pulse duration must be a positive integer in milliseconds.")
     if offset:
         cmd_ms = cmd_for_effective_ms(duration_ms)   # duration_ms treated as target effective
     else:
@@ -194,10 +290,10 @@ def safe_select(target: str, sel_pin, shutter_pin) -> bool:
 
     return True
 
-def _start_recording_log(recording_tag: str, offset: bool):
+def _start_recording_log(recording_tag: str, offset):
     os.makedirs(COMMAND_LOG_DIR, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    mode = "comp" if offset else "raw"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    mode = "mixed" if offset is None else ("comp" if offset else "raw")
     name = f"{recording_tag}_{mode}_{ts}.csv"
     path = os.path.join(COMMAND_LOG_DIR, name)
     f = open(path, "w", newline="")
@@ -211,6 +307,7 @@ def _start_recording_log(recording_tag: str, offset: bool):
             "send_time_iso",
             "send_time_epoch_s",
             "elapsed_s",
+            "success",
         ],
     )
     writer.writeheader()
@@ -229,46 +326,72 @@ def sweep_pulses(shutter_pin, durations_ms, gap_s=3.0, offset=False, recording_t
     try:
         for i, requested_ms in enumerate(durations_ms, start=1):
             # ensure closed baseline before each test pulse
-            close_shutter(shutter_pin)
-            time.sleep(gap_s)
+            if isinstance(shutter_pin, FastShutterPin):
+                if not shutter_pin.prepare_pulse(minimum_s=gap_s):
+                    return False
+            else:
+                if not close_shutter(shutter_pin):
+                    return False
+                time.sleep(gap_s)
 
             commanded_ms = cmd_for_effective_ms(requested_ms) if offset else int(requested_ms)
-            send_epoch = time.time()
-            send_iso = datetime.fromtimestamp(send_epoch).isoformat(timespec="milliseconds")
-            elapsed = time.perf_counter() - t0
-
             print(
-                f"[{elapsed:8.3f}s] PULSE idx={i} req={requested_ms}ms "
-                f"cmd={commanded_ms}ms send={send_iso}"
+                f"PULSE idx={i} req={requested_ms}ms cmd={commanded_ms}ms"
             )
-
+            send_epoch = time.time()
+            elapsed = time.perf_counter() - t0
+            succeeded = _pulse_shutter_raw(shutter_pin, int(commanded_ms))
+            # Disk I/O is outside the open/close pulse interval. Timestamps are
+            # host dispatch times, not measured electrical edges at the Arduino.
             log_w.writerow({
                 "pulse_index": i,
                 "requested_ms": int(requested_ms),
                 "commanded_ms": int(commanded_ms),
                 "compensated": int(bool(offset)),
-                "send_time_iso": send_iso,
+                "send_time_iso": datetime.fromtimestamp(send_epoch).isoformat(timespec="milliseconds"),
                 "send_time_epoch_s": f"{send_epoch:.6f}",
                 "elapsed_s": f"{elapsed:.6f}",
+                "success": int(succeeded),
             })
             log_f.flush()
 
-            if not _pulse_shutter_raw(shutter_pin, int(commanded_ms)):
+            if not succeeded:
                 print("[ERROR] Pulse command failed; stopping sweep.")
-                break
+                return False
     finally:
         log_f.close()
 
-    close_shutter(shutter_pin)
+    if not close_shutter(shutter_pin):
+        return False
     print("Sweep done.")
+    return True
 
 
-def main(port=DEFAULT_PORT):
+def main(port=None, fast=False, min_closed_ms=FAST_MIN_CLOSED_MS, sweep_gap_s=None):
+    if not math.isfinite(min_closed_ms) or min_closed_ms <= 0:
+        raise ValueError("Minimum closed time must be finite and greater than zero.")
+    if sweep_gap_s is not None and (not math.isfinite(sweep_gap_s) or sweep_gap_s <= 0):
+        raise ValueError("Sweep gap must be finite and greater than zero.")
+    exit_mode = EXIT_MODE
+    exit_relay = "off" if fast else EXIT_RELAY
+    session_log = None
+    pulse_index = 0
 
-    global EXIT_MODE, EXIT_RELAY
+    port = select_serial_port(port)
+    # Keep discovery and --list-ports independent of Firmata connections.
+    from pyfirmata import Arduino, util
 
+    if fast:
+        print("FAST mode: the A-only lock applies after initialization; firmware controls relay state during reset/boot.")
     print(f"Connecting to Arduino on {port}...")
-    board = Arduino(port)
+    try:
+        board = Arduino(port)
+    except (OSError, SerialException) as exc:
+        raise PortSelectionError(
+            f"Could not open {port}: {exc}. Check the USB connection, close other "
+            "programs using the port, and check your serial-device permissions. "
+            "Use --list-ports to inspect devices or --port to select another."
+        ) from exc
 
     # Start Firmata iterator thread (improves robustness)
     it = util.Iterator(board)
@@ -280,34 +403,56 @@ def main(port=DEFAULT_PORT):
 
     shutter_pin = board.get_pin(f'd:{SHUTTER_PIN_NUM}:o')  # D8 output
     sel_pin     = board.get_pin(f'd:{SELECT_PIN_NUM}:o')   # D9 output
+    if fast:
+        shutter_pin = FastShutterPin(shutter_pin, min_closed_ms=min_closed_ms)
+        sel_pin = RelayOffPin(sel_pin)
 
     # Safe startup
     
-    print("Seting up, please wait ~10 seconds.")
+    print("Setting up, please wait ~10 seconds. Startup settling is retained.")
     time.sleep(5.0)
-    select_shutter_a(sel_pin)
+    # D8 and D9 share a Firmata digital port. Establish D9 HIGH before any
+    # D8 writes so those combined port messages also keep the relay OFF.
+    if not select_shutter_a(sel_pin):
+        raise PortSelectionError("Could not establish selector OFF/A; startup aborted. Hardware state is unknown.")
     current = "A"
     time.sleep(3.0)
-    close_shutter(shutter_pin)
+    if not close_shutter(shutter_pin):
+        raise PortSelectionError("Could not close Shutter A; startup aborted. Hardware state is unknown.")
+    # Last successfully commanded state, not physical blade-position feedback.
+    commanded_state = CLOSED_STATE
     time.sleep(2.0)
 
      # Command loop
-    print("Connected. Safe Switching version")
+    print("Connected. FAST A-only mode" if fast else "Connected. Safe Switching version")
+    if fast:
+        print(f"Selector locked OFF/NC. Minimum commanded-closed recovery: {min_closed_ms:g} ms (provisional).")
+        print("Start camera recording BEFORE issuing sw/swo; fast sweeps have no countdown.")
     print("Commands:")
     print("  o           -> open shutter (selected)")
     print("  c           -> close shutter")
-    print("  p <ms>      -> pulse with compensation from master_inverse_lookup.csv")
-    print("  p <ms> n    -> pulse RAW command (no compensation)")
-    print("  ra          -> select Shutter A (relays OFF -> NC) [SAFE SWITCH]")
-    print("  rb          -> select Shutter B (relays ON  -> NO) [SAFE SWITCH]")
-    print("  rt          -> relay toggle test (A<->B) [SAFE SWITCH]")
+    print("  p <ms>      -> RAW pulse (no compensation; default)")
+    print("  p <ms> o    -> offset/compensated pulse using the existing calibration")
+    if fast:
+        print("  ra/rb/rt    -> disabled; Shutter A only")
+    else:
+        print("  ra          -> select Shutter A (relays OFF -> NC) [SAFE SWITCH]")
+        print("  rb          -> select Shutter B (relays ON  -> NO) [SAFE SWITCH]")
+        print("  rt          -> relay toggle test (A<->B) [SAFE SWITCH]")
     print("  sw          -> enter Sweep Pulse mode (predefined pulse train) for testing")
     print("  swo         -> enter Sweep Pulse mode with offset compensation for testing")
-    print("  q           -> quit")
-    #print("  qc          -> quit, leaving selected shutter CLOSED (energized)")
+    print("  q           -> quit OPEN and relay energized")
+    print("  qoff/qcoff  -> quit OPEN/CLOSED with RELAY selector OFF (always OFF in fast mode)")
     print(f"\nCurrent shutter: {current}")
 
     try:
+        if fast:
+            # Allocate the log before READY, not in the first pulse's path.
+            log_path, log_f, log_w = _start_recording_log("fast_manual", offset=None)
+            session_log = (log_f, log_w)
+            print(f"Manual command log: {log_path}")
+        session_t0 = time.perf_counter()
+        print("READY")
         while True:
             cmd_line = input("> ").strip()
             if not cmd_line:
@@ -316,69 +461,86 @@ def main(port=DEFAULT_PORT):
             parts = cmd_line.split()
             cmd = parts[0].lower()
 
+            if fast and cmd in ('ra', 'rb', 'rt'):
+                print("Fast mode is locked to Shutter A (NC); relay switching is disabled.")
+                continue
+
             if cmd == 'o':
-                if not open_shutter(shutter_pin, delay=True):
+                if not open_shutter(shutter_pin, delay=not fast):
                     break
+                commanded_state = OPEN_STATE
                 print(f"Shutter {current}: OPEN")
 
             elif cmd == 'c':
-                if not close_shutter(shutter_pin, delay=True):
+                if not close_shutter(shutter_pin, delay=not fast):
                     break
+                commanded_state = CLOSED_STATE
                 print(f"Shutter {current}: CLOSED")
 
             elif cmd == 'p':
-                duration_ms = 1000
-                raw_mode = False
-                if len(parts) > 1:
-                    try:
-                        duration_ms = int(parts[1])
-                    except ValueError:
-                        print("Invalid ms; using default 1000.")
-
-                if len(parts) > 2:
-                    token = parts[2].strip().lower()
-                    if token == "n":
-                        raw_mode = True
-                    else:
-                        print("Usage: p <ms> [n]")
-                        continue
-
-                if raw_mode:
-                    cmd_ms = int(duration_ms)
-                    print(f"Pulsing Shutter {current} RAW for {cmd_ms} ms (no compensation)...")
-                else:
-                    cmd_ms = cmd_for_effective_ms(duration_ms)
+                try:
+                    duration_ms, offset = parse_pulse_command(parts)
+                except ValueError as exc:
+                    print(exc)
+                    continue
+                cmd_ms = cmd_for_effective_ms(duration_ms) if offset else duration_ms
+                if commanded_state == OPEN_STATE:
                     print(
-                        f"Pulsing Shutter {current} target={duration_ms} ms "
-                        f"-> compensated command={cmd_ms} ms..."
+                        f"[WARNING] Shutter {current} was already commanded OPEN before this manual pulse. "
+                        "Your recording may include extra exposure before the pulse; "
+                        "the requested duration/compensation does not account for that light."
                     )
-
+                    if fast:
+                        print(
+                            f"Fast mode: close -> wait at least {min_closed_ms:g} ms -> "
+                            f"open for {cmd_ms} ms -> close. "
+                            "Closing first cannot remove light already recorded."
+                        )
+                    else:
+                        print(
+                            f"Normal mode: continue the existing open interval for {cmd_ms} ms, "
+                            "then close. This is not an isolated exposure."
+                        )
+                if fast and not shutter_pin.prepare_pulse():
+                    break
                 send_epoch = time.time()
-                send_iso = datetime.fromtimestamp(send_epoch).isoformat(timespec="milliseconds")
-                log_path, log_f, log_w = _start_recording_log(
-                    recording_tag="manual_pulse",
-                    offset=(not raw_mode),
-                )
-                log_w.writerow({
-                    "pulse_index": 1,
+                elapsed = time.perf_counter() - session_t0
+                succeeded = _pulse_shutter_raw(shutter_pin, cmd_ms)
+                commanded_state = CLOSED_STATE if succeeded else None
+                pulse_index += 1
+                row = {
+                    "pulse_index": pulse_index if fast else 1,
                     "requested_ms": int(duration_ms),
                     "commanded_ms": int(cmd_ms),
-                    "compensated": int(not raw_mode),
-                    "send_time_iso": send_iso,
+                    "compensated": int(offset),
+                    "send_time_iso": datetime.fromtimestamp(send_epoch).isoformat(timespec="milliseconds"),
                     "send_time_epoch_s": f"{send_epoch:.6f}",
-                    "elapsed_s": "0.000000",
-                })
-                log_f.close()
-                print(f"Command log: {log_path}")
-
-                if not _pulse_shutter_raw(shutter_pin, cmd_ms):
+                    "elapsed_s": f"{elapsed:.6f}" if fast else "0.000000",
+                    "success": int(succeeded),
+                }
+                if fast:
+                    log_f, log_w = session_log
+                    log_w.writerow(row)
+                    log_f.flush()
+                else:
+                    log_path, log_f, log_w = _start_recording_log("manual_pulse", offset=offset)
+                    try:
+                        log_w.writerow(row)
+                    finally:
+                        log_f.close()
+                    print(f"Command log: {log_path}")
+                if not succeeded:
+                    print("[ERROR] Pulse command failed; stopping.")
                     break
+                mode = "COMPENSATED" if offset else "RAW"
+                print(f"Shutter {current}: {mode} request={duration_ms} ms, command={cmd_ms} ms; close command sent.")
 
             elif cmd == 'ra':
-                print("Switching to Shutter B...please wait 10 seconds for safety before sending commands.")
+                print("Switching to Shutter A...please wait 10 seconds for safety before sending commands.")
                 if not safe_select("A", sel_pin, shutter_pin):
                     break
                 current = "A"
+                commanded_state = CLOSED_STATE if SECOND_CLOSE_AFTER_SWITCH else OPEN_STATE
                 print("Selected Shutter A (relays OFF -> NC)")
 
             elif cmd == 'rb':
@@ -386,6 +548,7 @@ def main(port=DEFAULT_PORT):
                 if not safe_select("B", sel_pin, shutter_pin):
                     break
                 current = "B"
+                commanded_state = CLOSED_STATE if SECOND_CLOSE_AFTER_SWITCH else OPEN_STATE
                 time.sleep(5.0)
                 print("Selected Shutter B (relays ON -> NO)")
 
@@ -405,6 +568,7 @@ def main(port=DEFAULT_PORT):
                     break
                 print("  A (OFF)")
                 current = "A"
+                commanded_state = CLOSED_STATE if SECOND_CLOSE_AFTER_SWITCH else OPEN_STATE
                 print("Relay test done.")
 
             elif cmd == 'sw':
@@ -413,84 +577,71 @@ def main(port=DEFAULT_PORT):
                 durations2 = [10,12,15,17,20,22,24,26,28,30,32,34,36,38,40,42,45,50,60,75,80,85,100,150]
                 durations3 = [10,11,12,13,14,15,16,17,18,19,20,22,24,26,28,30]
                 durations4 = [75,76,77,78,79,80,81,82,83,84,85]
-                gap_s = 3.0 # gap between pulses in seconds 
-                print("Starting sweep. Start ASICap recording now.")
-                time.sleep(5.0)
-                sweep_pulses(
+                gap_s = sweep_gap_s if sweep_gap_s is not None else (min_closed_ms / 1000.0 if fast else 3.0)
+                print("Starting RAW sweep." if fast else "Starting sweep. Start ASICap recording now.")
+                if not fast:
+                    time.sleep(5.0)
+                if not sweep_pulses(
                     shutter_pin,
                     durations_ms=durations4,
                     gap_s=gap_s,
                     offset=False,
                     recording_tag="sw_durations4",
-                )
+                ):
+                    break
+                commanded_state = CLOSED_STATE
 
             elif cmd == 'swo':
                 # sweep for timing characterization in milliseconds
                 durations = [10,20,30,50,75,100,150,200,250,260,270,280,287,290,300,310,500,750,1000,1500,2000,2500,3000,4000]
-                gap_s = 2.0 # gap between pulses in seconds
-                print("Starting sweep with offset compensation. Start ASICap recording now.")
-                time.sleep(5.0)
-                sweep_pulses(
+                gap_s = sweep_gap_s if sweep_gap_s is not None else (min_closed_ms / 1000.0 if fast else 2.0)
+                print("Starting compensated sweep." if fast else "Starting sweep with offset compensation. Start ASICap recording now.")
+                if not fast:
+                    time.sleep(5.0)
+                if not sweep_pulses(
                     shutter_pin,
                     durations_ms=durations,
                     gap_s=gap_s,
                     offset=True,
                     recording_tag="swo_durations1",
-                )
+                ):
+                    break
+                commanded_state = CLOSED_STATE
 
-            elif cmd == 'q':
-                # default quit behavior
-                EXIT_MODE = "open"   # change default if you want
-                EXIT_RELAY = "on"
-                print("Quitting (default: leave shutter OPEN) and RELAY ON. Use qc for forced closed exit. May require manual reset.")
-                break
-                
-            elif cmd == 'qc':
-                EXIT_MODE = "closed"
-                EXIT_RELAY = "on"
-                print("Quitting: leave shutter CLOSED (energized) and RELAY ON.")
-                break
-
-            elif cmd == 'qoff':
-                EXIT_MODE = "open"
-                EXIT_RELAY = "off"
-                print("Quitting: leave shutter OPEN and relay OFF.")
-                break
-
-            elif cmd == 'qcoff':
-                EXIT_MODE = "closed"
-                EXIT_RELAY = "off"
-                print("Quitting: leave shutter OPEN and relay OFF.")
+            elif cmd in ('q', 'qc', 'qoff', 'qcoff'):
+                exit_mode = "closed" if cmd in ('qc', 'qcoff') else "open"
+                exit_relay = "off" if fast or cmd in ('qoff', 'qcoff') else "on"
+                print(f"Quitting: leave shutter {exit_mode.upper()} and relay {exit_relay.upper()}.")
                 break
 
 
             else:
-                print("Unknown command. Use: o, c, p <ms>, p <ms> n, ra, rb, rt, q")
+                print("Unknown command. Use: o, c, p <ms>, p <ms> o, sw, swo, q, qc")
+
+    except (KeyboardInterrupt, EOFError):
+        print("\nStopping; applying configured exit states.")
 
     finally:
         print("Exiting...setting final states...")
 
-        #1) Shutter exit state (skip the 1s command delay on exit)
-        try:
-            if EXIT_MODE == "open":
-                open_shutter(shutter_pin, delay=False)
-                print("Exit mode: Shutter OPEN (de-energized).")
+        if fast and (shutter_pin.failed or sel_pin.failed):
+            print("[ERROR] Serial failure: hardware state is unknown. No retries or relay changes; inspect/reset manually.")
+        else:
+            # Fast exits never energize the selector, including q/qc and Ctrl-C.
+            action = open_shutter if exit_mode == "open" else close_shutter
+            if action(shutter_pin, delay=False):
+                print(f"Exit command sent: shutter {exit_mode.upper()}.")
             else:
-                close_shutter(shutter_pin, delay=False)
-                print("Exit mode: Shutter CLOSED.")
-        except Exception:
-            pass
+                print("[ERROR] Could not set shutter exit state; hardware state is unknown.")
+            if not fast or not shutter_pin.failed:
+                relay_action = relay_off if fast or exit_relay == "off" else relay_on
+                if relay_action(sel_pin):
+                    print(f"Exit command sent: relay {'OFF' if fast else exit_relay.upper()}.")
+                else:
+                    print("[ERROR] Could not set selector exit state; hardware state is unknown.")
 
-        #2) Relay exit state
-        try:
-            if EXIT_RELAY == "on":
-                relay_on(sel_pin)   # RELAY_ON (active-low -> write(0)) => LEDs on
-                print("Exit mode: Relay ON (energized, LEDs on).")
-            else:
-                relay_off(sel_pin)
-                print("Exit mode: Relay OFF.")
-        except Exception:
-            pass
+        if session_log is not None:
+            session_log[0].close()
 
         # Give hardware a moment to settle before ending the program
         time.sleep(0.5)
@@ -498,7 +649,7 @@ def main(port=DEFAULT_PORT):
         # IMPORTANT:
         # If you call board.exit(), pyFirmata shuts down comms and some boards may reset pins.
         # If you want the pin to remain latched, try leaving DO_BOARD_EXIT=False.
-        if DO_BOARD_EXIT:
+        if DO_BOARD_EXIT and not fast:
             try:
                 board.exit()
             except Exception:
@@ -506,9 +657,64 @@ def main(port=DEFAULT_PORT):
 
         print("Done.")
 
+    return not (fast and (shutter_pin.failed or sel_pin.failed))
+
+
+def cli(argv=None):
+    def positive_float(value):
+        try:
+            number = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError("must be a positive finite number") from None
+        if not math.isfinite(number) or number <= 0:
+            raise argparse.ArgumentTypeError("must be a positive finite number")
+        return number
+
+    parser = argparse.ArgumentParser(
+        description="Control the UFO shutter; auto-detect the Arduino serial port."
+    )
+    parser.add_argument("port", nargs="?", help="Explicit port (legacy positional form)")
+    parser.add_argument("--port", dest="port_override", help="Explicit serial port")
+    parser.add_argument(
+        "--list-ports", action="store_true", help="List serial ports without connecting"
+    )
+    parser.add_argument(
+        "--fast", action="store_true",
+        help="Lock to Shutter A/NC, disable switching, and remove runtime command/countdown delays",
+    )
+    parser.add_argument(
+        "--min-closed-ms", type=positive_float, default=FAST_MIN_CLOSED_MS,
+        help=f"Fast-mode closed recovery guard in ms (default: {FAST_MIN_CLOSED_MS:g}; provisional)",
+    )
+    parser.add_argument(
+        "--sweep-gap-s", type=positive_float,
+        help="Closed gap for sw/swo; fast mode also enforces --min-closed-ms",
+    )
+    args = parser.parse_args(argv)
+    if args.port is not None and args.port_override is not None:
+        parser.error("Specify either a positional port or --port, not both.")
+
+    try:
+        if args.list_ports:
+            ports = available_ports()
+            for port in ports:
+                print(describe_port(port))
+            if not ports:
+                print("No serial ports found.")
+            return 0
+        succeeded = main(
+            port=args.port_override if args.port_override is not None else args.port,
+            fast=args.fast,
+            min_closed_ms=args.min_closed_ms,
+            sweep_gap_s=args.sweep_gap_s,
+        )
+        if succeeded is False:
+            return 1
+    except PortSelectionError as exc:
+        print(f"[PORT ERROR] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    port = DEFAULT_PORT
-    if len(sys.argv) > 1:
-        port = sys.argv[1]
-    main(port=port)
+    sys.exit(cli())

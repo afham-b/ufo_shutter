@@ -140,26 +140,31 @@ at the line where it is used. (typically line 185)
 **ufo_shutter.py** – Command-line Shutter Control
 
 This script:
-1. Connects to the Arduino on a given serial port
+1. Finds the Arduino's USB serial port on Windows, macOS, or Linux
 2. Configures D8 as a digital output
 3. Lets you open/close the shutter or pulse it for a specified time
 
 >Key configuration at the top of the script:
 
-Default serial port and pin; override from the command line if needed
-```bash
-DEFAULT_PORT = '/dev/cu.usbmodem101'   # macOS example
+Pin configuration (the serial port is discovered automatically):
+```python
 SHUTTER_PIN_NUM = 8                    # D8 on Arduino
 
 OPEN_STATE = 0    # logic level that OPENS the shutter (LOW in this setup)
 CLOSED_STATE = 1  # logic level that CLOSES the shutter
 ```
-you select ports for linux and windows using : 
-```bash
-DEFAULT_PORT = 'COM3'         #windows 
-DEFAULT_PORT = '/dev/ttyACM0' #linux
-```
-You can use the Arduino IDE to check which port the board is connected to, or use Devic Manager on Windows. 
+Port discovery uses the existing `pyserial` dependency and its
+[Windows, macOS, and Linux enumeration support](https://pyserial.readthedocs.io/en/latest/tools.html#serial.tools.list_ports.comports).
+When exactly one USB serial candidate is present, it is selected automatically.
+Common Arduino clones using CH340, CP210x, or FTDI adapters are supported too.
+If several candidates exist, or the available devices cannot be recognized,
+the script displays a numbered list and asks you to choose. In a non-interactive
+terminal, supply an explicit port instead. macOS `/dev/cu.*` ports are preferred
+over matching `/dev/tty.*` aliases when both are reported.
+
+Detection reads device metadata without opening ports or sending commands.
+USB metadata identifies a candidate, not its installed firmware; the selected
+Arduino still needs StandardFirmata. Only the selected port is opened.
 
 If your hardware is inverted (open actually closes), swap OPEN_STATE CLOSED_STATE.
 
@@ -169,33 +174,117 @@ CLOSED_STATE = 0  # logic level that CLOSES the shutter
 ```
 **Running the Script**
 
-#Activate the environment 
+Activate the environment on macOS/Linux:
 ```bash
 source .venv/bin/activate
 ```
-You can call the script in two ways
-# Option A: use the default port hardcoded in the script
+
+On Windows PowerShell:
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Automatically find the port:
 ```bash
 python ufo_shutter.py
 ```
 
-# Option B: specify the port explicitly as a parameter 
+List detected devices without connecting to the shutter:
 ```bash
-python ufo_shutter.py /dev/cu.usbmodem101
+python ufo_shutter.py --list-ports
 ```
+
+An explicit override is still available; use the device name shown by the listing:
+
+| Platform | Example |
+| --- | --- |
+| Windows | `python ufo_shutter.py --port COM3` |
+| macOS | `python ufo_shutter.py --port /dev/cu.usbserial-10` |
+| Linux | `python ufo_shutter.py --port /dev/ttyACM0` |
+
+The original positional form also works, for example
+`python ufo_shutter.py /dev/ttyUSB0`. If no port appears, check the data USB
+cable and the board's USB serial driver. If a port cannot be opened, close any
+serial monitor using it and check your account's serial-device permissions.
 
 **CLI commands**
 
 Once running, the script prints a small command menu:
-```bash 
+
+```text
 o → open shutter
 c → close shutter
-p <ms> → pulse open for <ms> milliseconds
-q → quit
+p <ms> → RAW commanded pulse, no compensation (default)
+p <ms> o → compensated pulse for a target exposure metric
+sw → raw pulse sweep using the existing duration list
+swo → compensated pulse sweep using the existing duration list
+ra / rb / rt → select A / select B / test switching (normal mode only)
+q    → quit open (relay energized)
+qoff / qcoff → quit open / closed with relay selector OFF
 ```
 
-Example: p 500 = open for 500 ms, then close
-If <ms> is omitted or invalid, defaults to 1000 ms
+`p 10` sends an open command, waits 10 ms on the host, then sends close.
+It does **not** imply 10 ms of delivered light. `p 10 o` instead maps the target
+through the existing inverse lookup (or existing linear fallback); this change
+does not recalibrate that mapping. `p` alone defaults to 1000 ms raw. Invalid,
+zero, negative, non-integer, or extra arguments are rejected without a pulse.
+
+### Fast mode: Shutter A only (NC)
+
+Start the controller with automatic port discovery on Windows, macOS, or Linux:
+
+```bash
+python ufo_shutter.py --fast
+```
+
+`--port` still works with `--fast`. Normal mode remains the default and retains
+the existing relay-switching delays. In fast mode:
+
+- The selector is commanded OFF (D9 HIGH), selecting A on NC. `ra`, `rb`, and
+  `rt` are disabled. All exit commands, Ctrl-C, and EOF preserve selector OFF;
+  `q` leaves A open and energized.
+- Cold-start/reset settling is unchanged. After `READY`, the extra one-second
+  manual-command delay and five-second sweep countdown are removed. Begin camera
+  recording **before** issuing `sw` or `swo`.
+- Every reopening waits for at least **200 ms since the last close command**.
+  Time already spent closed counts toward this guard. If a pulse is requested
+  while open, the script first closes and waits. The guard is outside the pulse's
+  requested duration; it is not exposure compensation.
+- The 200 ms guard is a provisional starting margin, **not a measured minimum or
+  safety guarantee**. The reported 75–80 ms motion time does not establish the
+  complete mechanical/electrical recovery time. Validate repeatability and duty
+  cycle on hardware before shortening it.
+- Fast sweeps use that recovery guard as their default closed gap. Increase the
+  gap for well-separated calibration events. A requested sweep gap cannot bypass
+  the fast-mode recovery guard.
+- Manual pulse logging is initialized before `READY`; rows are written after
+  each pulse closes. Sweeps have separate logs. `success` means host writes
+  returned successfully, not measured shutter motion. Times are host dispatch
+  timestamps, not camera synchronization or measured Arduino edges.
+- A detected serial-write failure stops further commands without retries or
+  reconnecting. Hardware state is then unknown and requires inspection.
+
+Examples with a longer recovery guard or separated calibration pulses:
+
+```bash
+python ufo_shutter.py --fast --min-closed-ms 300
+python ufo_shutter.py --fast --sweep-gap-s 3
+```
+
+Important limits: the A-only lock is software-enforced **after initialization**.
+Arduino reset/boot, firmware pin defaults, disconnection, or loss of power can
+override it; Python cannot guarantee a permanently de-energized selector. D9 is
+set HIGH before D8 writes because Firmata sends these pins together in digital
+port messages. Fast mode does not call `board.exit()`, but this is not a hardware
+interlock or a fix for inductive transients. Host scheduling and USB also still
+introduce pulse-timing jitter; fast mode removes intentional delays, not those
+sources of timing uncertainty or the shutter's physical opening/closing lag.
+
+Offline regression tests (simulated devices and clocks; no hardware actuation):
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 
 ---
